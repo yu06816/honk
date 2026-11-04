@@ -51,7 +51,12 @@ pub fn send_dae_event(
 /// cached. Physical reclamation always belongs to fenced userspace retirement.
 /// Suppression is recorded only once the ring accepted the hint, so a full ring
 /// never silences the tuple for the next second.
-#[inline(never)]
+///
+/// Inlined because kernel 6.6 sums a whole BPF call chain against one 512-byte
+/// stack budget, and this leaf contributed its own frame to the TCP ingress
+/// chain. It runs at most once per tuple owner per second, so the code growth
+/// costs nothing on the forwarding path.
+#[inline(always)]
 pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incarnation: u64) {
     let now = unsafe { bpf_ktime_get_ns() };
     if let Some(previous) = FLOW_EXPIRY_HINT.get_ptr(key) {

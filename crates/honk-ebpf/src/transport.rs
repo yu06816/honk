@@ -7,7 +7,6 @@ use aya_ebpf::{
 use aya_ebpf_bindings::helpers::{bpf_skb_load_bytes, bpf_skb_load_bytes_relative};
 use core::{ffi::c_long, mem, ptr};
 use honk_ebpf_common::{Tuples, conn::ParseTransportCtx, dae_ip::In6Addr};
-use crate::auxiliary::AuxPrep;
 use network_types::{
     eth::EthHdr,
     icmp::Icmpv6Hdr,
@@ -74,29 +73,6 @@ pub struct ParsedPacket {
     pub trace_id: u32,
     pub frag_id: u32,
     pub incarnation: u64,
-    /// Routing facts the LAN ingress path hands to its control-plane redirect.
-    /// They live here rather than in call arguments because BPF has five
-    /// argument registers and kernel 6.6 rejects the stack spill LLVM emits
-    /// for a sixth; this per-CPU element is already the packet's scratch.
-    pub redirect: RedirectFacts,
-}
-
-/// One packet's pending control-plane redirect inputs.
-///
-/// Every field is written and read through `core::ptr::write_volatile` /
-/// `read_volatile`; see `ingress::set_redirect` for why.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RedirectFacts {
-    pub routing_meta_raw: u64,
-    pub routing_generation: u64,
-    pub policy: AuxPrep,
-    /// Set when the redirect carries a committed flow's identity; the
-    /// not-yet-published path uses `ParsedPacket::trace_id`/`incarnation`.
-    pub state_owned: u8,
-    pub decision_token: u32,
-    pub state_trace_id: u32,
-    pub state_incarnation: u64,
 }
 
 /// Malformed packet: invalid header, bad length, too many extension headers.
