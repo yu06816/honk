@@ -7,6 +7,7 @@ use aya_ebpf::{
 use aya_ebpf_bindings::helpers::{bpf_skb_load_bytes, bpf_skb_load_bytes_relative};
 use core::{ffi::c_long, mem, ptr};
 use honk_ebpf_common::{Tuples, conn::ParseTransportCtx, dae_ip::In6Addr};
+use crate::auxiliary::AuxPrep;
 use network_types::{
     eth::EthHdr,
     icmp::Icmpv6Hdr,
@@ -82,11 +83,11 @@ pub struct ParsedPacket {
 
 /// One packet's pending control-plane redirect inputs.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct RedirectFacts {
     pub routing_meta_raw: u64,
     pub routing_generation: u64,
-    pub policy: u8,
+    pub policy: AuxPrep,
     /// Set when the redirect carries a committed flow's identity; the
     /// not-yet-published path uses `ParsedPacket::trace_id`/`incarnation`.
     pub state_owned: u8,

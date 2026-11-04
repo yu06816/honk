@@ -71,7 +71,7 @@ fn set_redirect(
     pkt.redirect = RedirectFacts {
         routing_meta_raw,
         routing_generation,
-        policy: policy as u8,
+        policy,
         state_owned: state.is_some() as u8,
         decision_token: state.map_or(0, |flow| flow.decision_token),
         state_trace_id: state.map_or(0, |flow| flow.trace_id),
