@@ -57,6 +57,20 @@ use crate::{
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 
+/// Redirect facts the LAN ingress path hands to
+/// [`redirect_lan_packet_to_control_plane`]. Passed by reference because BPF
+/// has five argument registers and kernel 6.6 rejects the stack spill LLVM
+/// emits for a sixth.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LanRedirect {
+    routing_meta_raw: u64,
+    routing_generation: u64,
+    policy: AuxPrep,
+    /// `None` until the flow owns a committed state.
+    state: Option<&'static ConnState>,
+}
+
 // #[inline(never)]: this body is the largest part of the LAN ingress frame.
 // Kernel 6.6 caps the whole BPF call chain at 512 stack bytes, so absorbing it
 // into `do_tproxy_lan_ingress` pushed that chain past the limit.
@@ -64,11 +78,14 @@ const AF_INET6: u8 = 10;
 fn redirect_lan_packet_to_control_plane(
     ctx: &TcContext,
     pkt: &ParsedPacket,
-    routing_meta_raw: u64,
-    policy: AuxPrep,
-    routing_generation: u64,
-    state: Option<&ConnState>,
+    redirect: &LanRedirect,
 ) -> Verdict {
+    let LanRedirect {
+        routing_meta_raw,
+        routing_generation,
+        policy,
+        state,
+    } = *redirect;
     if pkt.l4proto == IPPROTO_TCP && PARAM.load().tcp_daens_netns_id < 0 {
         return Err(TC_ACT_SHOT);
     }
@@ -435,10 +452,12 @@ fn cached_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, state: &ConnState) -
         return redirect_lan_packet_to_control_plane(
             ctx,
             pkt,
-            meta_raw,
-            AuxPrep::RedirectOnly,
-            0,
-            Some(state),
+            &LanRedirect {
+                routing_meta_raw: meta_raw,
+                routing_generation: 0,
+                policy: AuxPrep::RedirectOnly,
+                state: Some(state),
+            },
         );
     }
     if state.decision_token != 0 && (outbound != OUTBOUND_DIRECT || !offload || must != 0) {
@@ -458,10 +477,12 @@ fn cached_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, state: &ConnState) -
     redirect_lan_packet_to_control_plane(
         ctx,
         pkt,
-        meta_raw,
-        AuxPrep::Refresh,
-        0,
-        Some(state),
+        &LanRedirect {
+            routing_meta_raw: meta_raw,
+            routing_generation: 0,
+            policy: AuxPrep::Refresh,
+            state: Some(state),
+        },
     )
 }
 
@@ -636,10 +657,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return redirect_lan_packet_to_control_plane(
             ctx,
             pkt,
-            unsafe { tcp_state.meta.raw },
-            AuxPrep::tcp(&tcp_publisher),
-            0,
-            Some(tcp_state),
+            &LanRedirect {
+                routing_meta_raw: unsafe { tcp_state.meta.raw },
+                routing_generation: 0,
+                policy: AuxPrep::tcp(&tcp_publisher),
+                state: Some(tcp_state),
+            },
         );
     }
 
@@ -922,13 +945,20 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let verdict = redirect_lan_packet_to_control_plane(
         ctx,
         pkt,
-        unsafe {
-            crate::contrack::build_routing_meta(meta_outbound, mark, redirect_must, pkt.tuples.dscp)
+        &LanRedirect {
+            routing_meta_raw: unsafe {
+                crate::contrack::build_routing_meta(
+                    meta_outbound,
+                    mark,
+                    redirect_must,
+                    pkt.tuples.dscp,
+                )
                 .raw
+            },
+            routing_generation,
+            policy: aux_policy,
+            state: None,
         },
-        aux_policy,
-        routing_generation,
-        None,
     );
     verdict
 }
