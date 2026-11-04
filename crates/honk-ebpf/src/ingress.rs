@@ -18,7 +18,7 @@ use crate::{
     egress::wan_outbound_is_alive,
     log_shim::*,
     maps::LISTEN_SOCKET_MAP,
-    transport::{ParsedPacket, RedirectFacts},
+    transport::ParsedPacket,
 };
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
@@ -61,6 +61,11 @@ const AF_INET6: u8 = 10;
 /// hand that scratch to the redirect body. Keeping the facts in the scratch
 /// element, not in arguments, is what holds the call inside BPF's five
 /// argument registers on kernel 6.6.
+///
+/// Fields are written one at a time: constructing the whole `RedirectFacts`
+/// as a temporary makes LLVM copy a padded `#[repr(C)]` value through a
+/// register it never defined, which the verifier rejects with
+/// `R2 !read_ok`.
 fn set_redirect(
     pkt: &mut ParsedPacket,
     routing_meta_raw: u64,
@@ -68,15 +73,23 @@ fn set_redirect(
     policy: AuxPrep,
     state: Option<&ConnState>,
 ) {
-    pkt.redirect = RedirectFacts {
-        routing_meta_raw,
-        routing_generation,
-        policy,
-        state_owned: state.is_some() as u8,
-        decision_token: state.map_or(0, |flow| flow.decision_token),
-        state_trace_id: state.map_or(0, |flow| flow.trace_id),
-        state_incarnation: state.map_or(0, |flow| flow.incarnation),
-    };
+    pkt.redirect.routing_meta_raw = routing_meta_raw;
+    pkt.redirect.routing_generation = routing_generation;
+    pkt.redirect.policy = policy;
+    match state {
+        Some(flow) => {
+            pkt.redirect.state_owned = 1;
+            pkt.redirect.decision_token = flow.decision_token;
+            pkt.redirect.state_trace_id = flow.trace_id;
+            pkt.redirect.state_incarnation = flow.incarnation;
+        }
+        None => {
+            pkt.redirect.state_owned = 0;
+            pkt.redirect.decision_token = 0;
+            pkt.redirect.state_trace_id = 0;
+            pkt.redirect.state_incarnation = 0;
+        }
+    }
 }
 
 // #[inline(never)]: this body is the largest part of the LAN ingress frame.
@@ -89,22 +102,24 @@ fn set_redirect(
 // rejects.
 #[inline(never)]
 fn redirect_lan_packet_to_control_plane(ctx: &TcContext, pkt: &ParsedPacket) -> Verdict {
-    let RedirectFacts {
-        routing_meta_raw,
-        routing_generation,
-        policy,
-        state_owned,
-        decision_token,
-        state_trace_id,
-        state_incarnation,
-    } = pkt.redirect;
+    // Read one field at a time for the same reason `set_redirect` writes them
+    // that way: a struct-shaped copy of a padded `#[repr(C)]` value compiles
+    // to a load through an undefined register on this target.
+    let routing_meta_raw = pkt.redirect.routing_meta_raw;
+    let routing_generation = pkt.redirect.routing_generation;
+    let policy = pkt.redirect.policy;
     // A redirected flow's identity lives on its committed state; the
     // not-yet-published path has only the parsed packet.
-    let (decision_token, trace_id, incarnation) = if state_owned != 0 {
-        (decision_token, state_trace_id, state_incarnation)
+    let (decision_token, trace_id, incarnation) = if pkt.redirect.state_owned != 0 {
+        (
+            pkt.redirect.decision_token,
+            pkt.redirect.state_trace_id,
+            pkt.redirect.state_incarnation,
+        )
     } else {
         (0, pkt.trace_id, pkt.incarnation)
-    };    if pkt.l4proto == IPPROTO_TCP && PARAM.load().tcp_daens_netns_id < 0 {
+    };
+    if pkt.l4proto == IPPROTO_TCP && PARAM.load().tcp_daens_netns_id < 0 {
         return Err(TC_ACT_SHOT);
     }
     let routing_meta = RoutingMeta {
@@ -127,7 +142,7 @@ fn redirect_lan_packet_to_control_plane(ctx: &TcContext, pkt: &ParsedPacket) -> 
     let dns_fragment = dns_route_mark & NFQUEUE_SIGNATURE_MARK != 0;
     let now = unsafe { bpf_ktime_get_ns() };
 
-    // Account this LAN ï¿½?outbound packet against the final outbound
+    // Account this LAN ï¿?outbound packet against the final outbound
     // (redirect path; the direct+must pass-through exits count separately).
     crate::stats::count_tx(ctx, unsafe { routing_meta.data.outbound });
 
@@ -572,7 +587,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 
     // Broadcast/multicast destinations (DHCP, mDNS, SSDP, LLMNR) must never
-    // be routed, marked, or conntracked ï¿½?pass through immediately.
+    // be routed, marked, or conntracked ï¿?pass through immediately.
     if crate::transport::dst_is_special(pkt, link_h_len) {
         return pass_through_classified(ctx);
     }
@@ -660,7 +675,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return redirect_lan_packet_to_control_plane(ctx, pkt);
     }
 
-    // Per-flow log, gated by PARAM.padding2 bit 0 (userspace writes 0 ï¿½?off).
+    // Per-flow log, gated by PARAM.padding2 bit 0 (userspace writes 0 ï¿?off).
     if PARAM.load().padding2 & 1 != 0 {
         info!(ctx, target: "honk", "lan new flow: l4proto={} sport={} dport={}", pkt.l4proto, pkt.tuples.five.src_port, pkt.tuples.five.dst_port);
     }
@@ -886,7 +901,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 
     // Fail-closed for TCP when the conn state map is full.  Reuses the
-    // offload decision computed above ï¿½?no second flags read.
+    // offload decision computed above ï¿?no second flags read.
     if pkt.l4proto == IPPROTO_TCP && tcp_state.is_none() {
         if (outbound == OUTBOUND_DIRECT && must != 0 || offload_direct) && mark == 0 {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
@@ -909,10 +924,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if outbound == OUTBOUND_DIRECT {
         // Non-must direct the mode policy may not offload (Global mode, or
         // Rule mode with a possible SNI re-route pending): redirect to the
-        // control plane so the mode override ï¿½?and the SNI-sniffed
-        // re-route ï¿½?can re-decide the flow in userspace.
+        // control plane so the mode override ï¿?and the SNI-sniffed
+        // re-route ï¿?can re-decide the flow in userspace.
         if PARAM.load().padding2 & 1 != 0 {
-            info!(ctx, target: "honk", "direct(no must, no offload) ï¿½?control plane");
+            info!(ctx, target: "honk", "direct(no must, no offload) ï¿?control plane");
         }
     }
     // Direct bypasses the health gate; block and proxy outbounds do not.
