@@ -31,8 +31,8 @@ for line in open(DIS):
     if not mi:
         continue
     at, mnem, ops = int(mi.group(1), 16), mi.group(2), mi.group(3)
-    for off in re.findall(r'r10 - 0x([0-9a-f]+)', ops):
-        depth[cur] = max(depth[cur], int(off, 16))
+    for off in re.findall(r'r10\s*-\s*(0x[0-9a-f]+|[0-9]+)', ops):
+        depth[cur] = max(depth[cur], int(off, 0))
     if mnem == 'call':
         t = re.match(r'^(-?0x[0-9a-f]+)', ops.strip())
         if t:
