@@ -72,6 +72,40 @@ jobs:
       - name: Verify eBPF object has BTF
         run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
 
+      - name: Report per-function stack frames
+        run: |
+          set -euo pipefail
+          OBJ=crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
+          llvm-objdump -d --no-show-raw-insn "$OBJ" > /tmp/honk-ebpf.dis
+          python3 - <<'PY'
+          import re, collections
+          depth = collections.OrderedDict()
+          cur = None
+          for line in open('/tmp/honk-ebpf.dis'):
+              m = re.match(r'^[0-9a-f]+ <(.+)>:', line)
+              if m:
+                  cur = m.group(1)
+                  depth.setdefault(cur, 0)
+                  continue
+              if cur is None:
+                  continue
+              for off in re.findall(r'r10 - 0x([0-9a-f]+)', line):
+                  depth[cur] = max(depth[cur], int(off, 16))
+          rows = sorted(depth.items(), key=lambda kv: -kv[1])[:15]
+          print(f"{'frame':>6}  function")
+          for name, d in rows:
+              print(f"{d:>6}  {name}")
+          print()
+          print("SUM of all distinct non-zero frames:", sum(d for _, d in depth.items()))
+          PY
+
+      - name: Upload eBPF object
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: honk-ebpf-object
+          path: crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
+          retention-days: 14
+
       - name: Install zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
