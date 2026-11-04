@@ -109,13 +109,17 @@ impl Drop for RootHookGuard {
 fn query_one(cgroup_fd: i32, attach_type: bpf_attach_type) -> Result<Option<i32>> {
     let mut ids = [0u32; 8];
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.query.__bindgen_anon_1.target_fd = cgroup_fd as u32;
-    attr.query.attach_type = attach_type as u32;
-    attr.query.prog_ids = ids.as_mut_ptr() as u64;
-    attr.query.__bindgen_anon_2.prog_cnt = ids.len() as u32;
+    // Every `bpf_attr` union access is unsynchronized by construction: the
+    // kernel reads this struct only for the duration of the syscall below.
+    unsafe {
+        attr.query.__bindgen_anon_1.target_fd = cgroup_fd as u32;
+        attr.query.attach_type = attach_type as u32;
+        attr.query.prog_ids = ids.as_mut_ptr() as u64;
+        attr.query.__bindgen_anon_2.prog_cnt = ids.len() as u32;
+    }
     unsafe { bpf_syscall(BPF_PROG_QUERY as c_long, &mut attr) }
         .map_err(|error| anyhow!("querying cgroup attach type {attach_type:?}: errno={error}"))?;
-    match attr.query.__bindgen_anon_2.prog_cnt {
+    match unsafe { attr.query.__bindgen_anon_2.prog_cnt } {
         0 => Ok(None),
         1 => program_fd(ids[0]),
         other => Err(anyhow!(
@@ -127,7 +131,7 @@ fn query_one(cgroup_fd: i32, attach_type: bpf_attach_type) -> Result<Option<i32>
 
 fn program_fd(id: u32) -> Result<Option<i32>> {
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_6.__bindgen_anon_1.prog_id = id;
+    unsafe { attr.__bindgen_anon_6.__bindgen_anon_1.prog_id = id };
     match unsafe { bpf_syscall(BPF_PROG_GET_FD_BY_ID as c_long, &mut attr) } {
         Ok(fd) => Ok(Some(fd as i32)),
         // The program exited between the query and the lookup.
@@ -136,12 +140,19 @@ fn program_fd(id: u32) -> Result<Option<i32>> {
     }
 }
 
-fn prog_attach(cgroup_fd: i32, program_fd: i32, attach_type: bpf_attach_type, flags: u32) -> Result<()> {
+fn prog_attach(
+    cgroup_fd: i32,
+    program_fd: i32,
+    attach_type: bpf_attach_type,
+    flags: u32,
+) -> Result<()> {
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = cgroup_fd as u32;
-    attr.__bindgen_anon_5.attach_bpf_fd = program_fd as u32;
-    attr.__bindgen_anon_5.attach_type = attach_type as u32;
-    attr.__bindgen_anon_5.attach_flags = flags;
+    unsafe {
+        attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = cgroup_fd as u32;
+        attr.__bindgen_anon_5.attach_bpf_fd = program_fd as u32;
+        attr.__bindgen_anon_5.attach_type = attach_type as u32;
+        attr.__bindgen_anon_5.attach_flags = flags;
+    }
     unsafe { bpf_syscall(BPF_PROG_ATTACH as c_long, &mut attr) }
         .map(|_| ())
         .map_err(|error| anyhow!("BPF_PROG_ATTACH: errno={error}"))
@@ -149,9 +160,11 @@ fn prog_attach(cgroup_fd: i32, program_fd: i32, attach_type: bpf_attach_type, fl
 
 fn prog_detach(cgroup_fd: i32, program_fd: i32, attach_type: bpf_attach_type) -> Result<()> {
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = cgroup_fd as u32;
-    attr.__bindgen_anon_5.attach_bpf_fd = program_fd as u32;
-    attr.__bindgen_anon_5.attach_type = attach_type as u32;
+    unsafe {
+        attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = cgroup_fd as u32;
+        attr.__bindgen_anon_5.attach_bpf_fd = program_fd as u32;
+        attr.__bindgen_anon_5.attach_type = attach_type as u32;
+    }
     unsafe { bpf_syscall(BPF_PROG_DETACH as c_long, &mut attr) }
         .map(|_| ())
         .map_err(|error| anyhow!("BPF_PROG_DETACH: errno={error}"))

@@ -237,6 +237,7 @@ impl RealEbpfBackend {
         // the backend; missing support or a partial attachment is fatal.
         let mut cgroup_sock_links = Vec::new();
         let mut cgroup_sock_addr_links = Vec::new();
+        let mut hook_guards: Vec<cgroup_takeover::RootHookGuard> = Vec::new();
         let mut sock_addr_ready = true;
         let tcp_proof_link = if std::env::var_os("HONK_SKIP_CGROUP_HOOKS")
             .is_some_and(|value| value != "0")
@@ -292,7 +293,6 @@ impl RealEbpfBackend {
         // multi-program or BPF_LINK_CREATE attachment fail with EPERM. Those
         // hooks only feed `pname()`, but they are also the only ones honk can
         // share: `sock_ops` is separately required for TCP ownership.
-        let mut hook_guards: Vec<cgroup_takeover::RootHookGuard> = Vec::new();
         for (index, name) in cg_addr_names.iter().enumerate() {
             let p: &mut aya::programs::CgroupSockAddr = bpf
                 .program_mut(name)
