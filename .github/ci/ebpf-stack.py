@@ -98,7 +98,7 @@ for fn in depth:
     walk(fn, [], set())
 
 print('stack_frame  function')
-for name, d in sorted(depth.items(), key=lambda kv: -kv[1])[:12]:
+for name, d in [(n, d) for n, d in sorted(depth.items(), key=lambda kv: -kv[1]) if d > 0]:
     print(f'{d:>11}  {name}')
 
 print()
