@@ -1,8 +1,8 @@
 name: eBPF stack
 
 # Fast lane: build only the kernel object and report per-function stack
-# frames, so the 6.6 512-byte call-chain limit can be iterated in minutes
-# rather than with a full cross build.
+# frames plus the deepest call chain, so the 6.6 512-byte call-chain limit can
+# be iterated in minutes rather than with a full cross build.
 
 on:
   push:
@@ -72,34 +72,8 @@ jobs:
           set -euo pipefail
           OBJ=crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
           llvm-objdump -d --no-show-raw-insn "$OBJ" > /tmp/honk-ebpf.dis
-          python3 - <<'PY'
-          import re, collections, sys
-          depth = collections.OrderedDict()
-          slots = collections.OrderedDict()
-          cur = None
-          for line in open('/tmp/honk-ebpf.dis'):
-              m = re.match(r'^[0-9a-f]+ <(.+)>:', line)
-              if m:
-                  cur = m.group(1)
-                  depth.setdefault(cur, 0)
-                  slots.setdefault(cur, set())
-                  continue
-              if cur is None:
-                  continue
-              for off in re.findall(r'r10 - 0x([0-9a-f]+)', line):
-                  v = int(off, 16)
-                  depth[cur] = max(depth[cur], v)
-                  slots[cur].add(v)
-          print('stack_frame  function')
-          for name, d in sorted(depth.items(), key=lambda kv: -kv[1])[:12]:
-              print(f'{d:>11}  {name}')
-          print()
-          print('=== deepest slots for the largest frames ===')
-          for name, d in sorted(depth.items(), key=lambda kv: -kv[1])[:4]:
-              used = sorted(slots[name], reverse=True)[:14]
-              print(f'{d:>5}  {name}')
-              print(f'       slots: {" ".join(hex(s) for s in used)}')
-          PY
+          llvm-objdump -r "$OBJ" > /tmp/honk-ebpf.rel
+          python3 .github/ci/ebpf-stack.py /tmp/honk-ebpf.dis /tmp/honk-ebpf.rel
 
       - name: Upload eBPF object
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
