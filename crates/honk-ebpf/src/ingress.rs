@@ -63,12 +63,12 @@ const AF_INET6: u8 = 10;
 /// emits for a sixth.
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct LanRedirect {
+struct LanRedirect<'a> {
     routing_meta_raw: u64,
     routing_generation: u64,
     policy: AuxPrep,
     /// `None` until the flow owns a committed state.
-    state: Option<&'static ConnState>,
+    state: Option<&'a ConnState>,
 }
 
 // #[inline(never)]: this body is the largest part of the LAN ingress frame.
@@ -78,7 +78,7 @@ struct LanRedirect {
 fn redirect_lan_packet_to_control_plane(
     ctx: &TcContext,
     pkt: &ParsedPacket,
-    redirect: &LanRedirect,
+    redirect: &LanRedirect<'_>,
 ) -> Verdict {
     let LanRedirect {
         routing_meta_raw,
