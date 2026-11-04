@@ -24,6 +24,12 @@ fn android_netd_owns_sock_addr_hooks() -> bool {
     std::path::Path::new("/sys/fs/bpf/netd_shared").is_dir()
 }
 
+/// Bring-up escape hatch: the datapath starts without the cgroup hooks netd
+/// holds in single-program mode. TCP ownership proof and `pname()` are lost.
+pub(super) fn cgroup_hooks_skipped() -> bool {
+    std::env::var_os("HONK_SKIP_CGROUP_HOOKS").is_some_and(|value| value != "0")
+}
+
 impl RealEbpfBackend {
     /// `local_ip` is the IPv4 (`u32::from_ne_bytes` of the octets) of the first
     /// resolved LAN, else WAN, interface; 0 when it has none. No configured
@@ -222,11 +228,22 @@ impl RealEbpfBackend {
         // the backend; missing support or a partial attachment is fatal.
         let mut cgroup_sock_links = Vec::new();
         let mut cgroup_sock_addr_links = Vec::new();
-        let cgroup_path = detect_cgroup_path()
-            .map_err(|error| anyhow::anyhow!("required socket identity capture: {error}"))?;
-        let cgroup_file = std::fs::File::open(&cgroup_path)
-            .map_err(|e| anyhow::anyhow!("open cgroup {}: {}", cgroup_path, e))?;
-        let (create_name, cg_addr_names) = match pname_mode {
+        let mut sock_addr_ready = true;
+        let tcp_proof_link = if std::env::var_os("HONK_SKIP_CGROUP_HOOKS")
+            .is_some_and(|value| value != "0")
+        {
+            warn!(
+                "HONK_SKIP_CGROUP_HOOKS is set: no cgroup hooks are attached, so pname() \
+                 never matches and TCP flows have no ownership proof"
+            );
+            sock_addr_ready = false;
+            None
+        } else {
+            let cgroup_path = detect_cgroup_path()
+                .map_err(|error| anyhow::anyhow!("required socket identity capture: {error}"))?;
+            let cgroup_file = std::fs::File::open(&cgroup_path)
+                .map_err(|e| anyhow::anyhow!("open cgroup {}: {}", cgroup_path, e))?;
+            let (create_name, cg_addr_names) = match pname_mode {
             process_name::PnameCaptureMode::Argv0 => (
                 "tproxy_wan_cg_sock_create",
                 [
@@ -266,7 +283,6 @@ impl RealEbpfBackend {
         // multi-program or BPF_LINK_CREATE attachment fail with EPERM. Those
         // hooks only feed `pname()`; losing them degrades that rule form
         // instead of failing startup, which is what a gateway needs.
-        let mut sock_addr_ready = true;
         for name in &cg_addr_names {
             let p: &mut aya::programs::CgroupSockAddr = bpf
                 .program_mut(name)
@@ -293,12 +309,14 @@ impl RealEbpfBackend {
                 }
             }
         }
-        let tcp_proof_link = tcp_binding::attach(&mut bpf, &cgroup_file)?;
+        let tcp_proof = tcp_binding::attach(&mut bpf, &cgroup_file)?;
         info!(
             "Attached cgroup identity programs to {} (sock_addr hooks ready: {})",
             cgroup_path,
             cgroup_sock_addr_links.len()
         );
+        Some(tcp_proof)
+        };
         // Initialize outbound connectivity map: all entries are alive by default.
         // This map is updated by health checks; until then we must not drop
         // proxy-bound traffic. Skipping entries here marks every outbound
@@ -387,7 +405,7 @@ impl RealEbpfBackend {
             retirement_failed: false,
             #[cfg(test)]
             retirement_faults: Default::default(),
-            tcp_proof_link: Some(tcp_proof_link),
+            tcp_proof_link,
             cap_lookup_batch: BatchCapability::new(),
             cap_flow_lookup_batch: BatchCapability::new(),
             tcp_live_pins,

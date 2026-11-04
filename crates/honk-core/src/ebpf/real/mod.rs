@@ -1039,10 +1039,16 @@ impl EbpfBackend for RealEbpfBackend {
         udp6_fds: &[RawFd],
     ) -> anyhow::Result<()> {
         self.listeners_published = false;
-        anyhow::ensure!(
-            self.tcp_proof_link.is_some(),
-            "required TCP ownership hooks are not attached"
-        );
+        if self.tcp_proof_link.is_none() {
+            anyhow::ensure!(
+                attach::cgroup_hooks_skipped(),
+                "required TCP ownership hooks are not attached"
+            );
+            warn!(
+                "TCP listeners publish without ownership proof; transparent TCP will not \
+                 be intercepted until the cgroup sock_ops hook is available"
+            );
+        }
         self.publish_listener_socket_maps(tcp4_fd, tcp6_fd, udp4_fds, udp6_fds)
     }
 

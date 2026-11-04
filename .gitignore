@@ -80,4 +80,4 @@ target-armbench
 
 # local build artifacts
 /dist/
-/dist2/
+/dist*/
