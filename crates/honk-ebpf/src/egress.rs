@@ -217,7 +217,10 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
 /// WAN egress TCP handler: route new connections and cache the decision;
 /// for established flows, reuse the cached routing.
-#[inline(always)]
+/// WAN egress TCP path. A real call, so its locals and the UDP path's do not
+/// share one frame: kernel 6.6 caps the whole BPF call chain at 512 stack
+/// bytes and the merged entry frame exceeded it.
+#[inline(never)]
 fn do_tproxy_wan_egress_tcp(
     ctx: &TcContext,
     link_h_len: u32,
@@ -586,7 +589,8 @@ fn fast_path_decision(
 }
 
 /// WAN egress UDP handler.
-#[inline(always)]
+/// WAN egress UDP path, kept off the TCP call chain's frame budget.
+#[inline(never)]
 fn do_tproxy_wan_egress_udp(
     ctx: &TcContext,
     link_h_len: u32,
