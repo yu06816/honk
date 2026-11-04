@@ -66,6 +66,12 @@ const AF_INET6: u8 = 10;
 /// value, and LLVM otherwise hoists one of those loads above the conntrack
 /// call that follows and keeps it in `r2`, which BPF does not preserve across
 /// a call; the verifier then rejects the program with `R2 !read_ok`.
+///
+/// A real call rather than an inlined body for the same reason: inlining put
+/// the `flow` loads in the caller's frame, where the surrounding conntrack
+/// calls had already consumed every register. Five arguments keeps it inside
+/// the BPF argument-register budget.
+#[inline(never)]
 fn set_redirect(
     pkt: &mut ParsedPacket,
     routing_meta_raw: u64,
