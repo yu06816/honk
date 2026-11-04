@@ -82,6 +82,9 @@ pub struct ParsedPacket {
 }
 
 /// One packet's pending control-plane redirect inputs.
+///
+/// Every field is written and read through `core::ptr::write_volatile` /
+/// `read_volatile`; see `ingress::set_redirect` for why.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RedirectFacts {

@@ -62,10 +62,10 @@ const AF_INET6: u8 = 10;
 /// element, not in arguments, is what holds the call inside BPF's five
 /// argument registers on kernel 6.6.
 ///
-/// Fields are written one at a time: constructing the whole `RedirectFacts`
-/// as a temporary makes LLVM copy a padded `#[repr(C)]` value through a
-/// register it never defined, which the verifier rejects with
-/// `R2 !read_ok`.
+/// The stores are volatile on purpose. These values are read out of a map
+/// value, and LLVM otherwise hoists one of those loads above the conntrack
+/// call that follows and keeps it in `r2`, which BPF does not preserve across
+/// a call; the verifier then rejects the program with `R2 !read_ok`.
 fn set_redirect(
     pkt: &mut ParsedPacket,
     routing_meta_raw: u64,
@@ -73,21 +73,24 @@ fn set_redirect(
     policy: AuxPrep,
     state: Option<&ConnState>,
 ) {
-    pkt.redirect.routing_meta_raw = routing_meta_raw;
-    pkt.redirect.routing_generation = routing_generation;
-    pkt.redirect.policy = policy;
-    match state {
-        Some(flow) => {
-            pkt.redirect.state_owned = 1;
-            pkt.redirect.decision_token = flow.decision_token;
-            pkt.redirect.state_trace_id = flow.trace_id;
-            pkt.redirect.state_incarnation = flow.incarnation;
-        }
-        None => {
-            pkt.redirect.state_owned = 0;
-            pkt.redirect.decision_token = 0;
-            pkt.redirect.state_trace_id = 0;
-            pkt.redirect.state_incarnation = 0;
+    let facts = &mut pkt.redirect;
+    unsafe {
+        core::ptr::write_volatile(&mut facts.routing_meta_raw, routing_meta_raw);
+        core::ptr::write_volatile(&mut facts.routing_generation, routing_generation);
+        core::ptr::write_volatile(&mut facts.policy, policy);
+        match state {
+            Some(flow) => {
+                core::ptr::write_volatile(&mut facts.state_owned, 1);
+                core::ptr::write_volatile(&mut facts.decision_token, flow.decision_token);
+                core::ptr::write_volatile(&mut facts.state_trace_id, flow.trace_id);
+                core::ptr::write_volatile(&mut facts.state_incarnation, flow.incarnation);
+            }
+            None => {
+                core::ptr::write_volatile(&mut facts.state_owned, 0);
+                core::ptr::write_volatile(&mut facts.decision_token, 0);
+                core::ptr::write_volatile(&mut facts.state_trace_id, 0);
+                core::ptr::write_volatile(&mut facts.state_incarnation, 0);
+            }
         }
     }
 }
@@ -105,17 +108,26 @@ fn redirect_lan_packet_to_control_plane(ctx: &TcContext, pkt: &ParsedPacket) -> 
     // Read one field at a time for the same reason `set_redirect` writes them
     // that way: a struct-shaped copy of a padded `#[repr(C)]` value compiles
     // to a load through an undefined register on this target.
-    let routing_meta_raw = pkt.redirect.routing_meta_raw;
-    let routing_generation = pkt.redirect.routing_generation;
-    let policy = pkt.redirect.policy;
+    let (routing_meta_raw, routing_generation, policy) = unsafe {
+        (
+            core::ptr::read_volatile(&pkt.redirect.routing_meta_raw),
+            core::ptr::read_volatile(&pkt.redirect.routing_generation),
+            core::ptr::read_volatile(&pkt.redirect.policy),
+        )
+    };
     // A redirected flow's identity lives on its committed state; the
     // not-yet-published path has only the parsed packet.
-    let (decision_token, trace_id, incarnation) = if pkt.redirect.state_owned != 0 {
-        (
-            pkt.redirect.decision_token,
-            pkt.redirect.state_trace_id,
-            pkt.redirect.state_incarnation,
-        )
+    let (decision_token, trace_id, incarnation) = if unsafe {
+        core::ptr::read_volatile(&pkt.redirect.state_owned)
+    } != 0
+    {
+        unsafe {
+            (
+                core::ptr::read_volatile(&pkt.redirect.decision_token),
+                core::ptr::read_volatile(&pkt.redirect.state_trace_id),
+                core::ptr::read_volatile(&pkt.redirect.state_incarnation),
+            )
+        }
     } else {
         (0, pkt.trace_id, pkt.incarnation)
     };
