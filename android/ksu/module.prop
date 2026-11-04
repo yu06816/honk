@@ -1,0 +1,6 @@
+id=honk
+name=honk transparent proxy
+version=v0.1.0-android
+versionCode=1
+author=honk-android
+description=WAN-only eBPF transparent proxy (honk). Requires KernelSU/Magisk root.

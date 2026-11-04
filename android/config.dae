@@ -1,0 +1,57 @@
+# honk on Android — WAN-only transparent proxy.
+#
+# The phone has no forwarded LAN traffic, so only `wan_interface` is set:
+# honk intercepts traffic originated by the device itself. An empty
+# `lan_interface` disables the LAN hook entirely.
+#
+# Everything starts on `fallback: direct` so the first run exercises the
+# whole datapath (TC redirect -> daens -> TPROXY -> userspace -> dial)
+# without needing a working node. Add nodes and routing rules after the
+# datapath is proven.
+
+global {
+    # `auto` follows the lowest-metric IPv4 default route. It moves with
+    # Wi-Fi / cellular switches; pin it to wlan0 or rmnet_data0 to debug.
+    wan_interface: auto
+    lan_interface:
+    log_level: info
+    log_file: honk.log
+    dial_mode: domain
+    allow_insecure: false
+    auto_config_kernel_parameter: true
+    # NFQUEUE owns an nftables table; keep it off on Android.
+    nfqueue_enable: false
+    data_dir: /data/adb/honk
+    tcp_check_url: 'https://www.gstatic.com/generate_204'
+    tcp_check_http_method: HEAD
+    udp_check_dns: '8.8.8.8:53,1.1.1.1:53'
+    check_interval: 300s
+    check_tolerance: 50ms
+}
+
+experimental {
+    clash_api {
+        external_controller: 127.0.0.1:9090
+        external_ui: ''
+        secret: ''
+    }
+}
+
+node {
+    # Replace with a real node, then point a routing rule at `proxy`.
+    # example: 'socks5://10.10.10.1:2077'
+}
+
+group {
+    proxy {
+        filter: name('example')
+        policy: fixed(0)
+    }
+}
+
+routing {
+    # pname() matches the process basename, so per-app split is possible
+    # without UID plumbing once the datapath is proven.
+    # pname('com.example.app') -> proxy
+    fallback: direct
+}

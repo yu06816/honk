@@ -31,13 +31,20 @@ impl RealEbpfBackend {
     ) -> anyhow::Result<Self> {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
-        anyhow::ensure!(
-            version >= (6, 12, 0),
-            "compiled routing requires Linux 6.12 or newer (running {}.{}.{})",
-            version.0,
-            version.1,
-            version.2
-        );
+        if version < (6, 12, 0) {
+            anyhow::ensure!(
+                std::env::var_os("HONK_ALLOW_UNSUPPORTED_KERNEL")
+                    .is_some_and(|value| value != "0"),
+                "compiled routing requires Linux 6.12 or newer (running {}.{}.{})",
+                version.0,
+                version.1,
+                version.2
+            );
+            warn!(
+                "Kernel {}.{}.{} is below the supported 6.12 floor; compiled routing is unverified",
+                version.0, version.1, version.2
+            );
+        }
         layout::validate_object(obj)?;
         let (kernel_data, kernel_btf) = btf::load_kernel()?;
         let process_name_offsets = process_name::detect(&kernel_data);
