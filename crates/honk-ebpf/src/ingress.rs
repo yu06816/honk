@@ -18,7 +18,7 @@ use crate::{
     egress::wan_outbound_is_alive,
     log_shim::*,
     maps::LISTEN_SOCKET_MAP,
-    transport::ParsedPacket,
+    transport::{ParsedPacket, RedirectFacts},
 };
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
@@ -57,44 +57,56 @@ use crate::{
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 
-/// Redirect facts the LAN ingress path hands to
-/// [`redirect_lan_packet_to_control_plane`]. Passed by reference because BPF
-/// has five argument registers and kernel 6.6 rejects the stack spill LLVM
-/// emits for a sixth.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct LanRedirect<'a> {
+/// Record a pending control-plane redirect on the packet's per-CPU scratch and
+/// hand that scratch to the redirect body. Keeping the facts in the scratch
+/// element, not in arguments, is what holds the call inside BPF's five
+/// argument registers on kernel 6.6.
+fn set_redirect(
+    pkt: &mut ParsedPacket,
     routing_meta_raw: u64,
     routing_generation: u64,
     policy: AuxPrep,
-    /// `None` until the flow owns a committed state.
-    state: Option<&'a ConnState>,
+    state: Option<&ConnState>,
+) {
+    pkt.redirect = RedirectFacts {
+        routing_meta_raw,
+        routing_generation,
+        policy: policy as u8,
+        state_owned: state.is_some() as u8,
+        decision_token: state.map_or(0, |flow| flow.decision_token),
+        state_trace_id: state.map_or(0, |flow| flow.trace_id),
+        state_incarnation: state.map_or(0, |flow| flow.incarnation),
+    };
 }
 
 // #[inline(never)]: this body is the largest part of the LAN ingress frame.
 // Kernel 6.6 caps the whole BPF call chain at 512 stack bytes, so absorbing it
 // into `do_tproxy_lan_ingress` pushed that chain past the limit.
+//
+// It also takes only the context and the packet: the redirect inputs already
+// live in `pkt.redirect`, the per-CPU scratch element. BPF has five argument
+// registers, and a sixth makes LLVM spill through `r11`, which the verifier
+// rejects.
 #[inline(never)]
-fn redirect_lan_packet_to_control_plane(
-    ctx: &TcContext,
-    pkt: &ParsedPacket,
-    redirect: &LanRedirect<'_>,
-) -> Verdict {
-    let LanRedirect {
+fn redirect_lan_packet_to_control_plane(ctx: &TcContext, pkt: &ParsedPacket) -> Verdict {
+    let RedirectFacts {
         routing_meta_raw,
         routing_generation,
         policy,
-        state,
-    } = *redirect;
-    if pkt.l4proto == IPPROTO_TCP && PARAM.load().tcp_daens_netns_id < 0 {
-        return Err(TC_ACT_SHOT);
-    }
+        state_owned,
+        decision_token,
+        state_trace_id,
+        state_incarnation,
+    } = pkt.redirect;
     // A redirected flow's identity lives on its committed state; the
     // not-yet-published path has only the parsed packet.
-    let (decision_token, trace_id, incarnation) = match state {
-        Some(state) => (state.decision_token, state.trace_id, state.incarnation),
-        None => (0, pkt.trace_id, pkt.incarnation),
-    };
+    let (decision_token, trace_id, incarnation) = if state_owned != 0 {
+        (decision_token, state_trace_id, state_incarnation)
+    } else {
+        (0, pkt.trace_id, pkt.incarnation)
+    };    if pkt.l4proto == IPPROTO_TCP && PARAM.load().tcp_daens_netns_id < 0 {
+        return Err(TC_ACT_SHOT);
+    }
     let routing_meta = RoutingMeta {
         raw: routing_meta_raw,
     };
@@ -406,7 +418,7 @@ fn lan_udp_local_service(ctx: &TcContext, pkt: &mut ParsedPacket) -> bool {
     false
 }
 
-fn cached_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, state: &ConnState) -> Verdict {
+fn cached_udp_decision(ctx: &TcContext, pkt: &mut ParsedPacket, state: &ConnState) -> Verdict {
     if state.is_wan_ingress_direction != 0 {
         return pass_through_classified(ctx);
     }
@@ -449,16 +461,8 @@ fn cached_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, state: &ConnState) -
         if state.decision_token == 0 {
             return Err(TC_ACT_SHOT);
         }
-        return redirect_lan_packet_to_control_plane(
-            ctx,
-            pkt,
-            &LanRedirect {
-                routing_meta_raw: meta_raw,
-                routing_generation: 0,
-                policy: AuxPrep::RedirectOnly,
-                state: Some(state),
-            },
-        );
+        set_redirect(pkt, meta_raw, 0, AuxPrep::RedirectOnly, Some(state));
+        return redirect_lan_packet_to_control_plane(ctx, pkt);
     }
     if state.decision_token != 0 && (outbound != OUTBOUND_DIRECT || !offload || must != 0) {
         return Err(TC_ACT_SHOT);
@@ -474,16 +478,8 @@ fn cached_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, state: &ConnState) -
     if !wan_outbound_is_alive(ctx, outbound, pkt.l4proto, pkt.tuples.five.dst_port) {
         return Err(TC_ACT_SHOT);
     }
-    redirect_lan_packet_to_control_plane(
-        ctx,
-        pkt,
-        &LanRedirect {
-            routing_meta_raw: meta_raw,
-            routing_generation: 0,
-            policy: AuxPrep::Refresh,
-            state: Some(state),
-        },
-    )
+    set_redirect(pkt, meta_raw, 0, AuxPrep::Refresh, Some(state));
+    redirect_lan_packet_to_control_plane(ctx, pkt)
 }
 
 /// Early-exit `TC_ACT_OK` after tagging the skb with `CLASSIFIED_MARK`, so the
@@ -654,16 +650,14 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
             return Err(TC_ACT_OK);
         }
-        return redirect_lan_packet_to_control_plane(
-            ctx,
+        set_redirect(
             pkt,
-            &LanRedirect {
-                routing_meta_raw: unsafe { tcp_state.meta.raw },
-                routing_generation: 0,
-                policy: AuxPrep::tcp(&tcp_publisher),
-                state: Some(tcp_state),
-            },
+            unsafe { tcp_state.meta.raw },
+            0,
+            AuxPrep::tcp(&tcp_publisher),
+            Some(tcp_state),
         );
+        return redirect_lan_packet_to_control_plane(ctx, pkt);
     }
 
     // Per-flow log, gated by PARAM.padding2 bit 0 (userspace writes 0 �?off).
@@ -942,25 +936,17 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             return Err(TC_ACT_SHOT);
         }
     }
-    let verdict = redirect_lan_packet_to_control_plane(
-        ctx,
+    set_redirect(
         pkt,
-        &LanRedirect {
-            routing_meta_raw: unsafe {
-                crate::contrack::build_routing_meta(
-                    meta_outbound,
-                    mark,
-                    redirect_must,
-                    pkt.tuples.dscp,
-                )
+        unsafe {
+            crate::contrack::build_routing_meta(meta_outbound, mark, redirect_must, pkt.tuples.dscp)
                 .raw
-            },
-            routing_generation,
-            policy: aux_policy,
-            state: None,
         },
+        routing_generation,
+        aux_policy,
+        None,
     );
-    verdict
+    redirect_lan_packet_to_control_plane(ctx, pkt)
 }
 
 // #[inline(never)]: shared by wan_ingress_l2/l3. Shallow call chain

@@ -79,6 +79,9 @@ pub struct RealEbpfBackend {
     #[cfg(test)]
     retirement_faults: retirement::RetirementFaults,
     tcp_proof_link: Option<aya::programs::sock_ops::SockOpsLink>,
+    /// Root-cgroup programs displaced to make room for honk's own hooks.
+    /// Held so they can be attached again on cleanup.
+    root_hook_guard: Option<cgroup_takeover::RootHookGuard>,
     /// Runtime probe for `BPF_MAP_LOOKUP_BATCH` (janitor map scans).
     cap_lookup_batch: BatchCapability,
     cap_flow_lookup_batch: BatchCapability,
@@ -173,6 +176,7 @@ impl RealEbpfBackend {
 mod attach;
 mod bindings;
 mod btf;
+mod cgroup_takeover;
 mod events;
 mod iface_watch;
 mod interface_startup;

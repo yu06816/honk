@@ -73,6 +73,26 @@ pub struct ParsedPacket {
     pub trace_id: u32,
     pub frag_id: u32,
     pub incarnation: u64,
+    /// Routing facts the LAN ingress path hands to its control-plane redirect.
+    /// They live here rather than in call arguments because BPF has five
+    /// argument registers and kernel 6.6 rejects the stack spill LLVM emits
+    /// for a sixth; this per-CPU element is already the packet's scratch.
+    pub redirect: RedirectFacts,
+}
+
+/// One packet's pending control-plane redirect inputs.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RedirectFacts {
+    pub routing_meta_raw: u64,
+    pub routing_generation: u64,
+    pub policy: u8,
+    /// Set when the redirect carries a committed flow's identity; the
+    /// not-yet-published path uses `ParsedPacket::trace_id`/`incarnation`.
+    pub state_owned: u8,
+    pub decision_token: u32,
+    pub state_trace_id: u32,
+    pub state_incarnation: u64,
 }
 
 /// Malformed packet: invalid header, bad length, too many extension headers.
