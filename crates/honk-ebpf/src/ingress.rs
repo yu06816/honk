@@ -57,21 +57,27 @@ use crate::{
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 
-#[inline(always)]
+// #[inline(never)]: this body is the largest part of the LAN ingress frame.
+// Kernel 6.6 caps the whole BPF call chain at 512 stack bytes, so absorbing it
+// into `do_tproxy_lan_ingress` pushed that chain past the limit.
+#[inline(never)]
 fn redirect_lan_packet_to_control_plane(
     ctx: &TcContext,
-    _link_h_len: u32,
     pkt: &ParsedPacket,
     routing_meta_raw: u64,
     policy: AuxPrep,
-    decision_token: u32,
     routing_generation: u64,
-    trace_id: u32,
-    incarnation: u64,
+    state: Option<&ConnState>,
 ) -> Verdict {
     if pkt.l4proto == IPPROTO_TCP && PARAM.load().tcp_daens_netns_id < 0 {
         return Err(TC_ACT_SHOT);
     }
+    // A redirected flow's identity lives on its committed state; the
+    // not-yet-published path has only the parsed packet.
+    let (decision_token, trace_id, incarnation) = match state {
+        Some(state) => (state.decision_token, state.trace_id, state.incarnation),
+        None => (0, pkt.trace_id, pkt.incarnation),
+    };
     let routing_meta = RoutingMeta {
         raw: routing_meta_raw,
     };
@@ -92,7 +98,7 @@ fn redirect_lan_packet_to_control_plane(
     let dns_fragment = dns_route_mark & NFQUEUE_SIGNATURE_MARK != 0;
     let now = unsafe { bpf_ktime_get_ns() };
 
-    // Account this LAN → outbound packet against the final outbound
+    // Account this LAN �?outbound packet against the final outbound
     // (redirect path; the direct+must pass-through exits count separately).
     crate::stats::count_tx(ctx, unsafe { routing_meta.data.outbound });
 
@@ -328,68 +334,62 @@ fn stage_udp_decision(
     Err(TC_ACT_OK)
 }
 
-#[inline(always)]
 /// UDP destination that a local socket already serves must not enter traffic
-    /// policy. Split out of the ingress body so its probe state stays off the
-    /// caller's frame: kernel 6.6 bounds the whole call chain to 512 bytes.
-    #[inline(never)]
-    fn lan_udp_local_service(ctx: &TcContext, pkt: &mut ParsedPacket) -> bool {
-        if pkt.l4proto != IPPROTO_UDP || pkt.tuples.five.dst_port == 53 {
-            return false;
-        }
-        if crate::contrack::udp::local_udp_reply_seen(&pkt.tuples.five) {
-            return true;
-        }
-        let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
-        let tuple_size = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
-            unsafe {
-                tuple.__bindgen_anon_1.ipv4.daddr = pkt.tuples.five.dst_ip.u6_addr32[3];
-                tuple.__bindgen_anon_1.ipv4.saddr = pkt.tuples.five.src_ip.u6_addr32[3];
-                tuple.__bindgen_anon_1.ipv4.dport = pkt.tuples.five.dst_port.to_be();
-                tuple.__bindgen_anon_1.ipv4.sport = pkt.tuples.five.src_port.to_be();
-            }
-            mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1>() as u32
-        } else {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    pkt.tuples.five.dst_ip.u6_addr32.as_ptr(),
-                    tuple.__bindgen_anon_1.ipv6.daddr.as_mut_ptr(),
-                    4,
-                );
-                core::ptr::copy_nonoverlapping(
-                    pkt.tuples.five.src_ip.u6_addr32.as_ptr(),
-                    tuple.__bindgen_anon_1.ipv6.saddr.as_mut_ptr(),
-                    4,
-                );
-                tuple.__bindgen_anon_1.ipv6.dport = pkt.tuples.five.dst_port.to_be();
-                tuple.__bindgen_anon_1.ipv6.sport = pkt.tuples.five.src_port.to_be();
-            }
-            mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32
-        };
-
-        let param = PARAM.load();
-        if let Some(probe) =
-            sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
-            && !probe.is_dae_socket
-            && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
-        {
-            // No routing witness is consumed after this local-service exit.
-            // Its tuple keeps nested expiry hints off the bounded TC stack.
-            crate::contrack::udp::observe_local_udp_reply(
-                &pkt.tuples.five,
-                &mut pkt.route_witness.tuple,
-            );
-            return true;
-        }
-        false
+/// policy. Split out of the ingress body so its probe state stays off the
+/// caller's frame: kernel 6.6 bounds the whole BPF call chain to 512 stack
+/// bytes, and this probe alone does not fit beside the ingress frame.
+#[inline(never)]
+fn lan_udp_local_service(ctx: &TcContext, pkt: &mut ParsedPacket) -> bool {
+    if pkt.l4proto != IPPROTO_UDP || pkt.tuples.five.dst_port == 53 {
+        return false;
     }
+    if crate::contrack::udp::local_udp_reply_seen(&pkt.tuples.five) {
+        return true;
+    }
+    let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+    let tuple_size = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
+        unsafe {
+            tuple.__bindgen_anon_1.ipv4.daddr = pkt.tuples.five.dst_ip.u6_addr32[3];
+            tuple.__bindgen_anon_1.ipv4.saddr = pkt.tuples.five.src_ip.u6_addr32[3];
+            tuple.__bindgen_anon_1.ipv4.dport = pkt.tuples.five.dst_port.to_be();
+            tuple.__bindgen_anon_1.ipv4.sport = pkt.tuples.five.src_port.to_be();
+        }
+        mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1>() as u32
+    } else {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pkt.tuples.five.dst_ip.u6_addr32.as_ptr(),
+                tuple.__bindgen_anon_1.ipv6.daddr.as_mut_ptr(),
+                4,
+            );
+            core::ptr::copy_nonoverlapping(
+                pkt.tuples.five.src_ip.u6_addr32.as_ptr(),
+                tuple.__bindgen_anon_1.ipv6.saddr.as_mut_ptr(),
+                4,
+            );
+            tuple.__bindgen_anon_1.ipv6.dport = pkt.tuples.five.dst_port.to_be();
+            tuple.__bindgen_anon_1.ipv6.sport = pkt.tuples.five.src_port.to_be();
+        }
+        mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32
+    };
 
-    fn cached_udp_decision(
-    ctx: &TcContext,
-    link_h_len: u32,
-    pkt: &ParsedPacket,
-    state: &ConnState,
-) -> Verdict {
+    let param = PARAM.load();
+    if let Some(probe) = sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+        && !probe.is_dae_socket
+        && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
+    {
+        // No routing witness is consumed after this local-service exit.
+        // Its tuple keeps nested expiry hints off the bounded TC stack.
+        crate::contrack::udp::observe_local_udp_reply(
+            &pkt.tuples.five,
+            &mut pkt.route_witness.tuple,
+        );
+        return true;
+    }
+    false
+}
+
+fn cached_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, state: &ConnState) -> Verdict {
     if state.is_wan_ingress_direction != 0 {
         return pass_through_classified(ctx);
     }
@@ -434,14 +434,11 @@ fn stage_udp_decision(
         }
         return redirect_lan_packet_to_control_plane(
             ctx,
-            link_h_len,
             pkt,
             meta_raw,
             AuxPrep::RedirectOnly,
-            state.decision_token,
             0,
-            state.trace_id,
-            state.incarnation,
+            Some(state),
         );
     }
     if state.decision_token != 0 && (outbound != OUTBOUND_DIRECT || !offload || must != 0) {
@@ -460,14 +457,11 @@ fn stage_udp_decision(
     }
     redirect_lan_packet_to_control_plane(
         ctx,
-        link_h_len,
         pkt,
         meta_raw,
         AuxPrep::Refresh,
-        state.decision_token,
         0,
-        state.trace_id,
-        state.incarnation,
+        Some(state),
     )
 }
 
@@ -561,7 +555,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 
     // Broadcast/multicast destinations (DHCP, mDNS, SSDP, LLMNR) must never
-    // be routed, marked, or conntracked — pass through immediately.
+    // be routed, marked, or conntracked �?pass through immediately.
     if crate::transport::dst_is_special(pkt, link_h_len) {
         return pass_through_classified(ctx);
     }
@@ -641,18 +635,15 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
         return redirect_lan_packet_to_control_plane(
             ctx,
-            link_h_len,
             pkt,
             unsafe { tcp_state.meta.raw },
             AuxPrep::tcp(&tcp_publisher),
             0,
-            0,
-            tcp_state.trace_id,
-            tcp_state.incarnation,
+            Some(tcp_state),
         );
     }
 
-    // Per-flow log, gated by PARAM.padding2 bit 0 (userspace writes 0 → off).
+    // Per-flow log, gated by PARAM.padding2 bit 0 (userspace writes 0 �?off).
     if PARAM.load().padding2 & 1 != 0 {
         info!(ctx, target: "honk", "lan new flow: l4proto={} sport={} dport={}", pkt.l4proto, pkt.tuples.five.src_port, pkt.tuples.five.dst_port);
     }
@@ -681,7 +672,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if let Some(state) =
             crate::contrack::udp::lookup_udp_available(&pkt.tuples.five).map_err(|_| TC_ACT_SHOT)?
         {
-            return cached_udp_decision(ctx, link_h_len, pkt, state);
+            return cached_udp_decision(ctx, pkt, state);
         }
     }
 
@@ -720,7 +711,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         {
             pkt.incarnation = incarnation;
         } else if let Some(state) = crate::contrack::udp::lookup_udp_seen(&pkt.tuples.five) {
-            return cached_udp_decision(ctx, link_h_len, pkt, state);
+            return cached_udp_decision(ctx, pkt, state);
         } else {
             return Err(TC_ACT_SHOT);
         }
@@ -878,7 +869,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 
     // Fail-closed for TCP when the conn state map is full.  Reuses the
-    // offload decision computed above — no second flags read.
+    // offload decision computed above �?no second flags read.
     if pkt.l4proto == IPPROTO_TCP && tcp_state.is_none() {
         if (outbound == OUTBOUND_DIRECT && must != 0 || offload_direct) && mark == 0 {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
@@ -901,10 +892,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if outbound == OUTBOUND_DIRECT {
         // Non-must direct the mode policy may not offload (Global mode, or
         // Rule mode with a possible SNI re-route pending): redirect to the
-        // control plane so the mode override — and the SNI-sniffed
-        // re-route — can re-decide the flow in userspace.
+        // control plane so the mode override �?and the SNI-sniffed
+        // re-route �?can re-decide the flow in userspace.
         if PARAM.load().padding2 & 1 != 0 {
-            info!(ctx, target: "honk", "direct(no must, no offload) → control plane");
+            info!(ctx, target: "honk", "direct(no must, no offload) �?control plane");
         }
     }
     // Direct bypasses the health gate; block and proxy outbounds do not.
@@ -930,17 +921,14 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
     let verdict = redirect_lan_packet_to_control_plane(
         ctx,
-        link_h_len,
         pkt,
         unsafe {
             crate::contrack::build_routing_meta(meta_outbound, mark, redirect_must, pkt.tuples.dscp)
                 .raw
         },
         aux_policy,
-        0,
         routing_generation,
-        pkt.trace_id,
-        pkt.incarnation,
+        None,
     );
     verdict
 }

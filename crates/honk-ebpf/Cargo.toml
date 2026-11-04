@@ -28,6 +28,4 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 lto = true
-# Kernel 6.6 bounds the whole BPF call chain to 512 stack bytes, where 6.12
-# admits more; the smaller optimization target keeps frames inside that bound.
-opt-level = "s"
+opt-level = 2
