@@ -1,0 +1,110 @@
+name: Android build
+
+on:
+  push:
+    branches: ["android-port"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  aarch64:
+    name: aarch64 musl + eBPF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust stable (with aarch64 musl target)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+          target: aarch64-unknown-linux-musl
+
+      - name: Install Rust nightly (for the eBPF object)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: android-aarch64-musl
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
+
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+
+      # The object is target-independent; build it once on the host and let
+      # build.rs pick it up for the cross build.
+      - name: Build eBPF object
+        run: |
+          set -euo pipefail
+          cd crates/honk-ebpf
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+
+      - name: Verify eBPF object has BTF
+        run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+
+      - name: Install zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.1
+
+      - name: Build honk-core (aarch64 musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          T=aarch64-unknown-linux-musl
+          export ZIGCC_TARGET="aarch64-linux-musl"
+          L=$(printf '%s' "$T" | tr '-' '_')
+          U=$(printf '%s' "$T" | tr 'a-z-' 'A-Z_')
+          eval "export CC_${L}=\$PWD/ci/zigcc"
+          eval "export CXX_${L}=\$PWD/ci/zigcxx"
+          eval "export CARGO_TARGET_${U}_LINKER=\$PWD/ci/zigcc"
+          eval "export CARGO_TARGET_${U}_RUSTFLAGS='-C link-self-contained=no'"
+          BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
+          export BINDGEN_EXTRA_CLANG_ARGS
+          cargo build --release -p honk-core --no-default-features \
+            --features "ebpf,rprx,clash-api,mimalloc" --target "$T"
+          file "target/$T/release/honk-core"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist/honk-android
+          cp target/aarch64-unknown-linux-musl/release/honk-core dist/honk-android/
+          cp LICENSE config.min.dae example.dae dist/honk-android/
+          tar -czf honk-android-aarch64.tar.gz -C dist honk-android
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: honk-android-aarch64
+          path: honk-android-aarch64.tar.gz
+          retention-days: 14
