@@ -329,7 +329,62 @@ fn stage_udp_decision(
 }
 
 #[inline(always)]
-fn cached_udp_decision(
+/// UDP destination that a local socket already serves must not enter traffic
+    /// policy. Split out of the ingress body so its probe state stays off the
+    /// caller's frame: kernel 6.6 bounds the whole call chain to 512 bytes.
+    #[inline(never)]
+    fn lan_udp_local_service(ctx: &TcContext, pkt: &mut ParsedPacket) -> bool {
+        if pkt.l4proto != IPPROTO_UDP || pkt.tuples.five.dst_port == 53 {
+            return false;
+        }
+        if crate::contrack::udp::local_udp_reply_seen(&pkt.tuples.five) {
+            return true;
+        }
+        let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
+        let tuple_size = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
+            unsafe {
+                tuple.__bindgen_anon_1.ipv4.daddr = pkt.tuples.five.dst_ip.u6_addr32[3];
+                tuple.__bindgen_anon_1.ipv4.saddr = pkt.tuples.five.src_ip.u6_addr32[3];
+                tuple.__bindgen_anon_1.ipv4.dport = pkt.tuples.five.dst_port.to_be();
+                tuple.__bindgen_anon_1.ipv4.sport = pkt.tuples.five.src_port.to_be();
+            }
+            mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1>() as u32
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pkt.tuples.five.dst_ip.u6_addr32.as_ptr(),
+                    tuple.__bindgen_anon_1.ipv6.daddr.as_mut_ptr(),
+                    4,
+                );
+                core::ptr::copy_nonoverlapping(
+                    pkt.tuples.five.src_ip.u6_addr32.as_ptr(),
+                    tuple.__bindgen_anon_1.ipv6.saddr.as_mut_ptr(),
+                    4,
+                );
+                tuple.__bindgen_anon_1.ipv6.dport = pkt.tuples.five.dst_port.to_be();
+                tuple.__bindgen_anon_1.ipv6.sport = pkt.tuples.five.src_port.to_be();
+            }
+            mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32
+        };
+
+        let param = PARAM.load();
+        if let Some(probe) =
+            sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+            && !probe.is_dae_socket
+            && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
+        {
+            // No routing witness is consumed after this local-service exit.
+            // Its tuple keeps nested expiry hints off the bounded TC stack.
+            crate::contrack::udp::observe_local_udp_reply(
+                &pkt.tuples.five,
+                &mut pkt.route_witness.tuple,
+            );
+            return true;
+        }
+        false
+    }
+
+    fn cached_udp_decision(
     ctx: &TcContext,
     link_h_len: u32,
     pkt: &ParsedPacket,
@@ -647,51 +702,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     };
 
     // A local DNS listener must not short-circuit the configured traffic policy.
-    if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port != 53 {
-        if crate::contrack::udp::local_udp_reply_seen(&pkt.tuples.five) {
-            return pass_through_classified(ctx);
-        }
-        let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
-        let tuple_size = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
-            unsafe {
-                tuple.__bindgen_anon_1.ipv4.daddr = pkt.tuples.five.dst_ip.u6_addr32[3];
-                tuple.__bindgen_anon_1.ipv4.saddr = pkt.tuples.five.src_ip.u6_addr32[3];
-                tuple.__bindgen_anon_1.ipv4.dport = pkt.tuples.five.dst_port.to_be();
-                tuple.__bindgen_anon_1.ipv4.sport = pkt.tuples.five.src_port.to_be();
-            }
-            mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_1>() as u32
-        } else {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    pkt.tuples.five.dst_ip.u6_addr32.as_ptr(),
-                    tuple.__bindgen_anon_1.ipv6.daddr.as_mut_ptr(),
-                    4,
-                );
-                core::ptr::copy_nonoverlapping(
-                    pkt.tuples.five.src_ip.u6_addr32.as_ptr(),
-                    tuple.__bindgen_anon_1.ipv6.saddr.as_mut_ptr(),
-                    4,
-                );
-                tuple.__bindgen_anon_1.ipv6.dport = pkt.tuples.five.dst_port.to_be();
-                tuple.__bindgen_anon_1.ipv6.sport = pkt.tuples.five.src_port.to_be();
-            }
-            mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32
-        };
-
-        let param = PARAM.load();
-        if let Some(probe) =
-            sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
-            && !probe.is_dae_socket
-            && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
-        {
-            // No routing witness is consumed after this local-service exit.
-            // Its tuple keeps nested expiry hints off the bounded TC stack.
-            crate::contrack::udp::observe_local_udp_reply(
-                &pkt.tuples.five,
-                &mut pkt.route_witness.tuple,
-            );
-            return pass_through_classified(ctx);
-        }
+    if lan_udp_local_service(ctx, pkt) {
+        return pass_through_classified(ctx);
     }
 
     // Counts the first packet of every UDP flow and each stateless UDP/53 packet.
