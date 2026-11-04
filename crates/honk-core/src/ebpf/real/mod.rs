@@ -60,6 +60,9 @@ pub struct RealEbpfBackend {
     cgroup_sock_links: Vec<aya::programs::cgroup_sock::CgroupSockLink>,
     /// cgroup connect4/6 + sendmsg4/6 links; same lifetime rule as above.
     cgroup_sock_addr_links: Vec<aya::programs::cgroup_sock_addr::CgroupSockAddrLink>,
+    /// False when netd holds those hooks in single-program mode; `pname()`
+    /// then sees no process name.
+    pname_sock_addr_ready: bool,
     pname_mode: process_name::PnameCaptureMode,
     dae0_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     dae0peer_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
@@ -824,7 +827,7 @@ impl EbpfBackend for RealEbpfBackend {
     /// Without the cgroup hooks `pname()` never matches and `!pname()`
     /// always does; without argv capture they see the thread name.
     fn pname_support(&self) -> super::PnameSupport {
-        if self.cgroup_sock_links.is_empty() {
+        if self.cgroup_sock_links.is_empty() || !self.pname_sock_addr_ready {
             super::PnameSupport::Unavailable
         } else if self.pname_mode == process_name::PnameCaptureMode::Comm {
             super::PnameSupport::ThreadName

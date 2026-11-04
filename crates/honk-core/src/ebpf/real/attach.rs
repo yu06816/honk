@@ -18,6 +18,12 @@ impl Drop for StartupPins<'_> {
     }
 }
 
+/// Android 15+ netd pins its own cgroup programs under `netd_shared` and holds
+/// the socket-address hooks in single-program mode.
+fn android_netd_owns_sock_addr_hooks() -> bool {
+    std::path::Path::new("/sys/fs/bpf/netd_shared").is_dir()
+}
+
 impl RealEbpfBackend {
     /// `local_ip` is the IPv4 (`u32::from_ne_bytes` of the octets) of the first
     /// resolved LAN, else WAN, interface; 0 when it has none. No configured
@@ -255,6 +261,12 @@ impl RealEbpfBackend {
                 anyhow::anyhow!("required socket identity program {create_name} attach: {error}")
             })?;
         cgroup_sock_links.push(p.take_link(link_id)?);
+        // Android 15+ netd attaches unflagged single-program programs to the
+        // cgroup v2 root's socket-address hooks, which makes every later
+        // multi-program or BPF_LINK_CREATE attachment fail with EPERM. Those
+        // hooks only feed `pname()`; losing them degrades that rule form
+        // instead of failing startup, which is what a gateway needs.
+        let mut sock_addr_ready = true;
         for name in &cg_addr_names {
             let p: &mut aya::programs::CgroupSockAddr = bpf
                 .program_mut(name)
@@ -265,15 +277,28 @@ impl RealEbpfBackend {
             p.load().map_err(|error| {
                 anyhow::anyhow!("required socket identity program {name} load: {error}")
             })?;
-            let link_id = p
-                .attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)
-                .map_err(|error| {
-                    anyhow::anyhow!("required socket identity program {name} attach: {error}")
-                })?;
-            cgroup_sock_addr_links.push(p.take_link(link_id)?);
+            match p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single) {
+                Ok(link_id) => cgroup_sock_addr_links.push(p.take_link(link_id)?),
+                Err(error) if android_netd_owns_sock_addr_hooks() => {
+                    warn!(
+                        "cgroup socket-address hook {name} is occupied by netd in \
+                         single-program mode ({error}); pname() rules will not match"
+                    );
+                    sock_addr_ready = false;
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "required socket identity program {name} attach: {error}"
+                    ));
+                }
+            }
         }
         let tcp_proof_link = tcp_binding::attach(&mut bpf, &cgroup_file)?;
-        info!("Attached 6 required cgroup programs to {}", cgroup_path);
+        info!(
+            "Attached cgroup identity programs to {} (sock_addr hooks ready: {})",
+            cgroup_path,
+            cgroup_sock_addr_links.len()
+        );
         // Initialize outbound connectivity map: all entries are alive by default.
         // This map is updated by health checks; until then we must not drop
         // proxy-bound traffic. Skipping entries here marks every outbound
@@ -348,6 +373,7 @@ impl RealEbpfBackend {
             bindings,
             cgroup_sock_links,
             cgroup_sock_addr_links,
+            pname_sock_addr_ready: sock_addr_ready,
             pname_mode,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,

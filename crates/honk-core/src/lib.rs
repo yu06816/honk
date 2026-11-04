@@ -320,7 +320,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         ClashCommand::Reload => {
-            let pid = request_reload(std::path::Path::new(INSTANCE_LOCK_PATH))?;
+            let pid = request_reload(&instance_lock_path(&cli.data_dir))?;
             println!("Reload requested for honk-core process {pid}");
         }
         ClashCommand::Mode { mode } => {
@@ -393,7 +393,19 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-const INSTANCE_LOCK_PATH: &str = "/run/honk-core.lock";
+/// Runtime instance-lock path. Android mounts an immutable root filesystem and
+/// has no `/run`, so `HONK_INSTANCE_LOCK` or the data directory supplies the
+/// lock where the FHS path does not exist.
+fn instance_lock_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("HONK_INSTANCE_LOCK") {
+        return std::path::PathBuf::from(path);
+    }
+    let run = std::path::Path::new("/run");
+    if run.is_dir() {
+        return run.join("honk-core.lock");
+    }
+    data_dir.join("honk-core.lock")
+}
 
 fn publish_instance_pid(file: &mut std::fs::File) -> anyhow::Result<()> {
     use std::io::Write;
@@ -525,7 +537,10 @@ thread_local! {
 
 /// Only the real datapath owns fixed dae0/daens/TC resources. Mock mode must
 /// remain usable without access to the process-global /run lock.
-fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+fn instance_lock(
+    mock_mode: bool,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
     #[cfg(test)]
     if let Some(path) = TEST_INSTANCE_LOCK.with(|path| path.borrow().clone()) {
         return acquire_instance_lock(&path, std::time::Duration::ZERO).map(Some);
@@ -533,9 +548,9 @@ fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std
     if mock_mode {
         return Ok(None);
     }
-    // /run, not the bpffs pin root, which rejects regular files.
+    // The default, not the bpffs pin root, which rejects regular files.
     acquire_instance_lock(
-        std::path::Path::new(INSTANCE_LOCK_PATH),
+        &instance_lock_path(data_dir),
         std::time::Duration::from_secs(240),
     )
     .map(Some)
@@ -774,7 +789,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     // Everything else in `run` drops before it.
-    let _instance_lock = instance_lock(mock_mode)?;
+    let _instance_lock = instance_lock(mock_mode, &cli.data_dir)?;
     #[cfg(feature = "native-api")]
     let mut database = None;
     let startup = (|| -> anyhow::Result<_> {

@@ -77,3 +77,7 @@ af-xdp-dataplane-proposal.md
 doc/en/design/owned-udp-nat-xdp-proposal.md
 doc/zh/design/owned-udp-nat-xdp-proposal.md
 target-armbench
+
+# local build artifacts
+/dist/
+/dist2/
