@@ -142,7 +142,7 @@ fn redirect_lan_packet_to_control_plane(ctx: &TcContext, pkt: &ParsedPacket) -> 
     let dns_fragment = dns_route_mark & NFQUEUE_SIGNATURE_MARK != 0;
     let now = unsafe { bpf_ktime_get_ns() };
 
-    // Account this LAN ï¿?outbound packet against the final outbound
+    // Account this LAN -?outbound packet against the final outbound
     // (redirect path; the direct+must pass-through exits count separately).
     crate::stats::count_tx(ctx, unsafe { routing_meta.data.outbound });
 
@@ -587,7 +587,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 
     // Broadcast/multicast destinations (DHCP, mDNS, SSDP, LLMNR) must never
-    // be routed, marked, or conntracked ï¿?pass through immediately.
+    // be routed, marked, or conntracked -?pass through immediately.
     if crate::transport::dst_is_special(pkt, link_h_len) {
         return pass_through_classified(ctx);
     }
@@ -675,7 +675,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return redirect_lan_packet_to_control_plane(ctx, pkt);
     }
 
-    // Per-flow log, gated by PARAM.padding2 bit 0 (userspace writes 0 ï¿?off).
+    // Per-flow log, gated by PARAM.padding2 bit 0 (userspace writes 0 -?off).
     if PARAM.load().padding2 & 1 != 0 {
         info!(ctx, target: "honk", "lan new flow: l4proto={} sport={} dport={}", pkt.l4proto, pkt.tuples.five.src_port, pkt.tuples.five.dst_port);
     }
@@ -901,7 +901,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
 
     // Fail-closed for TCP when the conn state map is full.  Reuses the
-    // offload decision computed above ï¿?no second flags read.
+    // offload decision computed above -?no second flags read.
     if pkt.l4proto == IPPROTO_TCP && tcp_state.is_none() {
         if (outbound == OUTBOUND_DIRECT && must != 0 || offload_direct) && mark == 0 {
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
@@ -924,10 +924,10 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if outbound == OUTBOUND_DIRECT {
         // Non-must direct the mode policy may not offload (Global mode, or
         // Rule mode with a possible SNI re-route pending): redirect to the
-        // control plane so the mode override ï¿?and the SNI-sniffed
-        // re-route ï¿?can re-decide the flow in userspace.
+        // control plane so the mode override -?and the SNI-sniffed
+        // re-route -?can re-decide the flow in userspace.
         if PARAM.load().padding2 & 1 != 0 {
-            info!(ctx, target: "honk", "direct(no must, no offload) ï¿?control plane");
+            info!(ctx, target: "honk", "direct(no must, no offload) -?control plane");
         }
     }
     // Direct bypasses the health gate; block and proxy outbounds do not.
