@@ -629,6 +629,7 @@ impl RealEbpfBackend {
             cgroup_sock_links: Vec::new(),
             cgroup_sock_addr_links: Vec::new(),
             pname_sock_addr_ready: true,
+            root_hook_guards: Vec::new(),
             pname_mode: process_name::PnameCaptureMode::Argv0,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,

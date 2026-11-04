@@ -81,7 +81,7 @@ pub struct RealEbpfBackend {
     tcp_proof_link: Option<aya::programs::sock_ops::SockOpsLink>,
     /// Root-cgroup programs displaced to make room for honk's own hooks.
     /// Held so they can be attached again on cleanup.
-    root_hook_guard: Option<cgroup_takeover::RootHookGuard>,
+    root_hook_guards: Vec<cgroup_takeover::RootHookGuard>,
     /// Runtime probe for `BPF_MAP_LOOKUP_BATCH` (janitor map scans).
     cap_lookup_batch: BatchCapability,
     cap_flow_lookup_batch: BatchCapability,
@@ -1081,6 +1081,20 @@ impl EbpfBackend for RealEbpfBackend {
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         // Detach eBPF programs immediately to restore network connectivity.
         self.detach_hooks()?;
+
+        // Put back any root-cgroup programs displaced from Android's netd.
+        // A flags=0 attach is refused while a multi-attach program still owns
+        // the hook, so this must follow `detach_hooks`.
+        for guard in &mut self.root_hook_guards {
+            if let Err(error) = guard.restore() {
+                warn!(
+                    error = %error,
+                    "could not restore a displaced root-cgroup program; netd traffic \
+                     accounting stays detached on that hook until netd restarts"
+                );
+            }
+        }
+        self.root_hook_guards.clear();
 
         // Stop the aya-log flush task before dropping the Ebpf object.
         if let Some(h) = self.log_flush_handle.take() {

@@ -16,12 +16,13 @@
 //! Restoring must run after honk's own link is detached: a flags=0 attach is
 //! refused while a multi-attach program still owns the hook.
 
+use std::ffi::c_long;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use anyhow::{Context, Result, anyhow};
 use aya_obj::generated::{
-    BPF_PROG_ATTACH, BPF_PROG_DETACH, BPF_PROG_GET_FD_BY_ID, BPF_PROG_QUERY, bpf_attach_type,
-    bpf_attr,
+    bpf_attach_type, bpf_attr,
+    bpf_cmd::{BPF_PROG_ATTACH, BPF_PROG_DETACH, BPF_PROG_GET_FD_BY_ID, BPF_PROG_QUERY},
 };
 
 use super::syscall::bpf_syscall;
@@ -66,7 +67,7 @@ impl RootHookGuard {
                 attach_type,
                 /* flags */ 0,
             )
-            .with_context(|| format!("restoring displaced cgroup program on {attach_type}"))?;
+            .with_context(|| format!("restoring displaced cgroup program on {attach_type:?}"))?;
         }
         Ok(())
     }
@@ -77,7 +78,7 @@ impl RootHookGuard {
                 return Ok(());
             };
             prog_detach(self.cgroup.as_raw_fd(), program, attach_type)
-                .with_context(|| format!("detaching foreign cgroup program on {attach_type}"))?;
+                .with_context(|| format!("detaching foreign cgroup program on {attach_type:?}"))?;
             // SAFETY: `program` is an fd this process owns, returned by
             // BPF_PROG_GET_FD_BY_ID and not wrapped anywhere else.
             self.displaced
@@ -112,14 +113,14 @@ fn query_one(cgroup_fd: i32, attach_type: bpf_attach_type) -> Result<Option<i32>
     attr.query.attach_type = attach_type as u32;
     attr.query.prog_ids = ids.as_mut_ptr() as u64;
     attr.query.__bindgen_anon_2.prog_cnt = ids.len() as u32;
-    unsafe { bpf_syscall(BPF_PROG_QUERY as _, &mut attr) }
-        .map_err(|error| anyhow!("querying cgroup attach type {attach_type}: errno={error}"))?;
+    unsafe { bpf_syscall(BPF_PROG_QUERY as c_long, &mut attr) }
+        .map_err(|error| anyhow!("querying cgroup attach type {attach_type:?}: errno={error}"))?;
     match attr.query.__bindgen_anon_2.prog_cnt {
         0 => Ok(None),
         1 => program_fd(ids[0]),
         other => Err(anyhow!(
-            "{other} programs already own cgroup attach type {attach_type}; that hook is not in \
-             the single-program mode this takeover can restore"
+            "{other} programs already own cgroup attach type {attach_type:?}; that hook is not \
+             in the single-program mode this takeover can restore"
         )),
     }
 }
@@ -127,10 +128,10 @@ fn query_one(cgroup_fd: i32, attach_type: bpf_attach_type) -> Result<Option<i32>
 fn program_fd(id: u32) -> Result<Option<i32>> {
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
     attr.__bindgen_anon_6.__bindgen_anon_1.prog_id = id;
-    match unsafe { bpf_syscall(BPF_PROG_GET_FD_BY_ID as _, &mut attr) } {
+    match unsafe { bpf_syscall(BPF_PROG_GET_FD_BY_ID as c_long, &mut attr) } {
         Ok(fd) => Ok(Some(fd as i32)),
         // The program exited between the query and the lookup.
-        Err(error) if error == libc::ENOENT as i64 => Ok(None),
+        Err(error) if error == libc::ENOENT as c_long => Ok(None),
         Err(error) => Err(anyhow!("opening cgroup program {id}: errno={error}")),
     }
 }
@@ -141,7 +142,7 @@ fn prog_attach(cgroup_fd: i32, program_fd: i32, attach_type: bpf_attach_type, fl
     attr.__bindgen_anon_5.attach_bpf_fd = program_fd as u32;
     attr.__bindgen_anon_5.attach_type = attach_type as u32;
     attr.__bindgen_anon_5.attach_flags = flags;
-    unsafe { bpf_syscall(BPF_PROG_ATTACH as _, &mut attr) }
+    unsafe { bpf_syscall(BPF_PROG_ATTACH as c_long, &mut attr) }
         .map(|_| ())
         .map_err(|error| anyhow!("BPF_PROG_ATTACH: errno={error}"))
 }
@@ -151,7 +152,7 @@ fn prog_detach(cgroup_fd: i32, program_fd: i32, attach_type: bpf_attach_type) ->
     attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = cgroup_fd as u32;
     attr.__bindgen_anon_5.attach_bpf_fd = program_fd as u32;
     attr.__bindgen_anon_5.attach_type = attach_type as u32;
-    unsafe { bpf_syscall(BPF_PROG_DETACH as _, &mut attr) }
+    unsafe { bpf_syscall(BPF_PROG_DETACH as c_long, &mut attr) }
         .map(|_| ())
         .map_err(|error| anyhow!("BPF_PROG_DETACH: errno={error}"))
 }

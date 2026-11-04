@@ -18,6 +18,15 @@ impl Drop for StartupPins<'_> {
     }
 }
 
+/// The cgroup v2 socket-address hooks the `pname()` capture programs attach
+/// to, in `cg_addr_names` order: connect4, connect6, sendmsg4, sendmsg6.
+const CG_ADDR_ATTACH_TYPES: [aya_obj::generated::bpf_attach_type; 4] = [
+    aya_obj::generated::bpf_attach_type::BPF_CGROUP_INET4_CONNECT,
+    aya_obj::generated::bpf_attach_type::BPF_CGROUP_INET6_CONNECT,
+    aya_obj::generated::bpf_attach_type::BPF_CGROUP_UDP4_SENDMSG,
+    aya_obj::generated::bpf_attach_type::BPF_CGROUP_UDP6_SENDMSG,
+];
+
 /// Android 15+ netd pins its own cgroup programs under `netd_shared` and holds
 /// the socket-address hooks in single-program mode.
 fn android_netd_owns_sock_addr_hooks() -> bool {
@@ -281,9 +290,10 @@ impl RealEbpfBackend {
         // Android 15+ netd attaches unflagged single-program programs to the
         // cgroup v2 root's socket-address hooks, which makes every later
         // multi-program or BPF_LINK_CREATE attachment fail with EPERM. Those
-        // hooks only feed `pname()`; losing them degrades that rule form
-        // instead of failing startup, which is what a gateway needs.
-        for name in &cg_addr_names {
+        // hooks only feed `pname()`, but they are also the only ones honk can
+        // share: `sock_ops` is separately required for TCP ownership.
+        let mut hook_guards: Vec<cgroup_takeover::RootHookGuard> = Vec::new();
+        for (index, name) in cg_addr_names.iter().enumerate() {
             let p: &mut aya::programs::CgroupSockAddr = bpf
                 .program_mut(name)
                 .and_then(|p| p.try_into().ok())
@@ -296,11 +306,29 @@ impl RealEbpfBackend {
             match p.attach(&cgroup_file, aya::programs::CgroupAttachMode::Single) {
                 Ok(link_id) => cgroup_sock_addr_links.push(p.take_link(link_id)?),
                 Err(error) if android_netd_owns_sock_addr_hooks() => {
+                    // netd holds this hook in single-program mode: take it over
+                    // and retry, keeping netd's program so cleanup restores it.
+                    // The array is ordered connect4, connect6, sendmsg4,
+                    // sendmsg6, matching `CG_ADDR_ATTACH_TYPES`.
+                    let attach_type = CG_ADDR_ATTACH_TYPES[index];
                     warn!(
-                        "cgroup socket-address hook {name} is occupied by netd in \
-                         single-program mode ({error}); pname() rules will not match"
+                        "cgroup socket-address hook {name} is held by netd in single-program \
+                         mode ({error}); displacing netd's program for the process lifetime"
                     );
-                    sock_addr_ready = false;
+                    hook_guards.push(cgroup_takeover::RootHookGuard::take(
+                        &cgroup_file,
+                        attach_type,
+                    )?);
+                    sock_addr_ready = true;
+                    let link_id = p
+                        .attach(&cgroup_file, aya::programs::CgroupAttachMode::Single)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "required socket identity program {name} attach after \
+                                 displacing netd: {error}"
+                            )
+                        })?;
+                    cgroup_sock_addr_links.push(p.take_link(link_id)?);
                 }
                 Err(error) => {
                     return Err(anyhow::anyhow!(
@@ -406,6 +434,7 @@ impl RealEbpfBackend {
             #[cfg(test)]
             retirement_faults: Default::default(),
             tcp_proof_link,
+            root_hook_guards: hook_guards,
             cap_lookup_batch: BatchCapability::new(),
             cap_flow_lookup_batch: BatchCapability::new(),
             tcp_live_pins,
